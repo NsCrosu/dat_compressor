@@ -31,12 +31,6 @@ _PAYLOAD_TYPE_METADATA = 3
 
 
 def create_usm(ivf_path: str, output_path: str) -> None:
-    """Create a CRI USM ``.dat`` file from a VP9 IVF elementary stream.
-
-    The implementation intentionally supports only VP9-in-IVF inputs, matching
-    the compression pipeline this package produces.
-    """
-
     source = Path(ivf_path)
     if not source.is_file():
         raise FileNotFoundError(f"Input IVF file not found: {ivf_path}")
@@ -57,12 +51,6 @@ def create_usm(ivf_path: str, output_path: str) -> None:
     max_frame_size = max(frame_sizes)
     max_packed_size = 0x18 + max_frame_size + _alignment_padding(max_frame_size, 0x20)
 
-    video_crid_payload = _create_video_crid_payload(
-        filename=source.name,
-        filesize=source.stat().st_size,
-        max_size=max_frame_size,
-        bitrate=bitrate,
-    )
     video_header_payload = _create_video_header_payload(
         width=int(video.get("width") or 0),
         height=int(video.get("height") or 0),
@@ -82,10 +70,10 @@ def create_usm(ivf_path: str, output_path: str) -> None:
     )
     prestream_chunks = _build_prestream_chunks(
         source,
-        video_crid_payload,
         video_header_payload,
         keyframe_offsets,
         max_packet_size,
+        max_frame_size,
         len(stream_bytes),
         bitrate,
     )
@@ -130,36 +118,48 @@ def _build_frame_sizes(offsets: list[int], file_size: int) -> list[int]:
     return sizes
 
 
-def _create_video_crid_payload(
+def _create_combined_crid_payload(
     *,
-    filename: str,
-    filesize: int,
-    max_size: int,
+    usm_filename: str,
+    video_filename: str,
+    usm_filesize: int,
+    video_filesize: int,
+    video_max_size: int,
+    usm_max_packet_size: int,
     bitrate: int,
 ) -> bytes:
     elements = [
-        ("fmtver", ElementType.INT, None),
+        ("fmtver", ElementType.I32, USM_FORMAT_VERSION),
         ("filename", ElementType.STRING, None),
-        ("filesize", ElementType.INT, None),
-        ("datasize", ElementType.INT, None),
-        ("stmid", ElementType.INT, None),
-        ("chno", ElementType.INT, None),
-        ("minchk", ElementType.INT, None),
-        ("minbuf", ElementType.INT, None),
-        ("avbps", ElementType.INT, None),
+        ("filesize", ElementType.I32, None),
+        ("datasize", ElementType.I32, 0),
+        ("stmid", ElementType.I32, None),
+        ("chno", ElementType.I16, None),
+        ("minchk", ElementType.I16, None),
+        ("minbuf", ElementType.I32, None),
+        ("avbps", ElementType.I32, bitrate),
     ]
-    page = {
-        "fmtver": VP9_FORMAT_VERSION,
-        "filename": filename,
-        "filesize": int(filesize),
-        "datasize": 0,
-        "stmid": 1079199318,
-        "chno": 0,
-        "minchk": 3,
-        "minbuf": int(max_size),
-        "avbps": int(bitrate),
-    }
-    return utf_table.pack_pages(elements, [page])
+    # Row 0: USM overall info
+    # Row 1: Video stream info (stmid = @SFV = 0x40534656)
+    pages = [
+        {
+            "filename": usm_filename,
+            "filesize": usm_filesize,
+            "stmid": 0,
+            "chno": -1,
+            "minchk": 1,
+            "minbuf": usm_max_packet_size,
+        },
+        {
+            "filename": video_filename,
+            "filesize": video_filesize,
+            "stmid": 0x40534656,
+            "chno": 0,
+            "minchk": 3,
+            "minbuf": video_max_size,
+        },
+    ]
+    return utf_table.pack_pages(elements, pages, page_name="CRIUSF_DIR_STREAM")
 
 
 def _create_video_header_payload(
@@ -171,28 +171,28 @@ def _create_video_header_payload(
     frame_rate: float,
     max_packed_size: int,
 ) -> bytes:
-    elements = [(name, ElementType.INT, None) for name in (
-        "width",
-        "height",
-        "mat_width",
-        "mat_height",
-        "disp_width",
-        "disp_height",
-        "scrn_width",
-        "mpeg_dcprec",
-        "mpeg_codec",
-        "alpha_type",
-        "total_frames",
-        "framerate_n",
-        "framerate_d",
-        "metadata_count",
-        "metadata_size",
-        "ixsize",
-        "pre_padding",
-        "max_picture_size",
-        "color_space",
-        "picture_type",
-    )]
+    elements = [
+        ("width", ElementType.I32, None),
+        ("height", ElementType.I32, None),
+        ("mat_width", ElementType.I32, None),
+        ("mat_height", ElementType.I32, None),
+        ("disp_width", ElementType.I32, None),
+        ("disp_height", ElementType.I32, None),
+        ("scrn_width", ElementType.I32, None),
+        ("mpeg_dcprec", ElementType.I8, None),
+        ("mpeg_codec", ElementType.I8, None),
+        ("alpha_type", ElementType.I32, None),
+        ("total_frames", ElementType.I32, None),
+        ("framerate_n", ElementType.I32, None),
+        ("framerate_d", ElementType.I32, None),
+        ("metadata_count", ElementType.I32, None),
+        ("metadata_size", ElementType.I32, None),
+        ("ixsize", ElementType.I32, None),
+        ("pre_padding", ElementType.I32, None),
+        ("max_picture_size", ElementType.I32, None),
+        ("color_space", ElementType.I32, None),
+        ("picture_type", ElementType.I32, None),
+    ]
     page = {
         "width": width,
         "height": height,
@@ -215,47 +215,15 @@ def _create_video_header_payload(
         "color_space": 0,
         "picture_type": 0,
     }
-    return utf_table.pack_pages(elements, [page])
-
-
-def _create_usm_crid_payload(
-    *,
-    filename: str,
-    size_after_crid_part: int,
-    max_packet_size: int,
-    bitrate: int,
-) -> bytes:
-    elements = [
-        ("fmtver", ElementType.INT, None),
-        ("filename", ElementType.STRING, None),
-        ("filesize", ElementType.INT, None),
-        ("datasize", ElementType.INT, None),
-        ("stmid", ElementType.INT, None),
-        ("chno", ElementType.INT, None),
-        ("minchk", ElementType.INT, None),
-        ("minbuf", ElementType.INT, None),
-        ("avbps", ElementType.INT, None),
-    ]
-    page = {
-        "fmtver": USM_FORMAT_VERSION,
-        "filename": filename,
-        "filesize": int(size_after_crid_part),
-        "datasize": 0,
-        "stmid": 0,
-        "chno": 0,
-        "minchk": 1,
-        "minbuf": int(max_packet_size),
-        "avbps": int(bitrate),
-    }
-    return utf_table.pack_pages(elements, [page])
+    return utf_table.pack_pages(elements, [page], page_name="VIDEO_HDRINFO")
 
 
 def _create_seekinfo_payload(keyframe_offsets: list[tuple[int, int]]) -> bytes:
     elements = [
-        ("ofs_byte", ElementType.LONGLONG, None),
-        ("ofs_frmid", ElementType.INT, None),
-        ("num_skip", ElementType.INT, None),
-        ("resv", ElementType.INT, None),
+        ("ofs_byte", ElementType.I64, None),
+        ("ofs_frmid", ElementType.U32, None),
+        ("num_skip", ElementType.U16, None),
+        ("resv", ElementType.U16, None),
     ]
     pages = [
         {"ofs_byte": offset, "ofs_frmid": frame_index, "num_skip": 0, "resv": 0}
@@ -263,7 +231,7 @@ def _create_seekinfo_payload(keyframe_offsets: list[tuple[int, int]]) -> bytes:
     ]
     if not pages:
         pages = [{"ofs_byte": 0, "ofs_frmid": 0, "num_skip": 0, "resv": 0}]
-    return utf_table.pack_pages(elements, pages)
+    return utf_table.pack_pages(elements, pages, page_name="VIDEO_SEEKINFO")
 
 
 def _pack_video_stream(
@@ -316,10 +284,10 @@ def _pack_video_stream(
 
 def _build_prestream_chunks(
     source: Path,
-    video_crid_payload: bytes,
     video_header_payload: bytes,
     keyframe_offsets: list[tuple[int, int]],
     max_packet_size: int,
+    video_max_frame_size: int,
     stream_size: int,
     bitrate: int,
 ) -> list[bytes]:
@@ -381,21 +349,24 @@ def _build_prestream_chunks(
     metadata_section_size = len(metadata_chunk) + len(metadata_end_chunk)
 
     header_metadata_size = current_position + metadata_section_size
-    size_after_crid_part = 0x800 + header_metadata_size + stream_size
-    usm_crid_payload = _create_usm_crid_payload(
-        filename=source.with_suffix(".usm").name,
-        size_after_crid_part=size_after_crid_part,
-        max_packet_size=max_packet_size,
+    size_after_crid_part = header_metadata_size + stream_size
+
+    crid_payload = _create_combined_crid_payload(
+        usm_filename=source.with_suffix(".usm").name,
+        video_filename=source.name,
+        usm_filesize=0x800 + size_after_crid_part,
+        video_filesize=int(source.stat().st_size),
+        video_max_size=video_max_frame_size,
+        usm_max_packet_size=max_packet_size,
         bitrate=bitrate,
     )
-    info_payload = usm_crid_payload + video_crid_payload
     info_chunk = _pack_chunk(
         _CRID_SIGNATURE,
         _PAYLOAD_TYPE_HEADER,
-        info_payload,
+        crid_payload,
         frame_rate=30,
         frame_time=0,
-        padding=_pad_to_next_sector(0, 0x20 + len(info_payload)),
+        padding=_pad_to_next_sector(0, 0x20 + len(crid_payload)),
         channel_number=0,
     )
 

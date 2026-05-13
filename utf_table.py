@@ -8,35 +8,29 @@ from typing import Any, Iterable, Mapping, Sequence
 
 
 class ElementType(IntEnum):
-    """Public element type values expected by the Python USM creator tasks."""
+    I8 = 0x10
+    U8 = 0x11
+    I16 = 0x12
+    U16 = 0x13
+    I32 = 0x14
+    U32 = 0x15
+    I64 = 0x16
+    U64 = 0x17
+    F32 = 0x18
+    STRING = 0x1A
+    BYTES = 0x1B
 
-    CHAR = 0x10
-    SHORT = 0x11
-    INT = 0x12
-    LONGLONG = 0x13
-    FLOAT = 0x14
-    STRING = 0x15
-    BYTES = 0x16
 
-
-_CONSTANT_FLAG = 0x10
-_PER_PAGE_FLAG = 0x30
-_STRING_ENCODING = "cp932"
+_RECURRING_FLAG = 1 << 5      # 0x20 — shared/constant column
+_NON_RECURRING_FLAG = 2 << 5  # 0x40 — per-page column
+_STRING_ENCODING = "UTF-8"
 
 
 def pack_pages(
     elements: Sequence[tuple[str, ElementType, Any]],
     pages: Sequence[Mapping[str, Any]],
+    page_name: str = "<NULL>",
 ) -> bytes:
-    """Serialize CRI @UTF pages.
-
-    ``elements`` defines the table columns as ``(name, type, constant_value)``.
-    When ``constant_value`` is not ``None`` the column is written once in the
-    column/shared-value area with the constant flag.  Otherwise each page must
-    provide the column value and the column definition receives the per-page
-    flag.
-    """
-
     if not elements:
         raise ValueError("elements must not be empty")
     if not pages:
@@ -46,7 +40,8 @@ def pack_pages(
     _validate_pages(normalized_elements, pages)
 
     strings = _StringTable()
-    table_name_offset = strings.add("<NULL>")
+    strings.add("<NULL>")
+    page_name_offset = strings.add(page_name)
     name_offsets = {name: strings.add(name) for name, _, _ in normalized_elements}
 
     column_data = bytearray()
@@ -55,15 +50,10 @@ def pack_pages(
 
     for name, element_type, constant_value in normalized_elements:
         if constant_value is None:
-            # Column definition: one type byte with the per-page flag, followed
-            # by a 32-bit string-table offset for the column name.  Actual row
-            # values are packed later in page order.
-            column_data.append(_PER_PAGE_FLAG | element_type)
+            column_data.append(_NON_RECURRING_FLAG | element_type)
             column_data.extend(_u32(name_offsets[name]))
         else:
-            # Constant/shared column: definition and its single shared value are
-            # stored together before the row data.
-            column_data.append(_CONSTANT_FLAG | element_type)
+            column_data.append(_RECURRING_FLAG | element_type)
             column_data.extend(_u32(name_offsets[name]))
             _pack_value(column_data, element_type, constant_value, strings, bytes_data)
 
@@ -80,22 +70,12 @@ def pack_pages(
     bytes_offset = string_offset + len(strings.data)
     table_size = bytes_offset + len(bytes_data)
 
-    # Binary layout:
-    #   0x00  "@UTF" signature
-    #   0x04  table size from the first header field through byte-array data
-    #   0x08  row-data offset relative to the first header field
-    #   0x0C  string-table offset relative to the first header field
-    #   0x10  byte-array table offset relative to the first header field
-    #   0x14  table-name string offset (WannaCRI uses "<NULL>")
-    #   0x18  column count
-    #   0x1A  per-row byte size for per-page values
-    #   0x1C  row/page count
     result = bytearray(b"@UTF")
     result.extend(_u32(table_size))
     result.extend(_u32(rows_offset))
     result.extend(_u32(string_offset))
     result.extend(_u32(bytes_offset))
-    result.extend(_u32(table_name_offset))
+    result.extend(_u32(page_name_offset))
     result.extend(_u16(len(normalized_elements)))
     result.extend(_u16(row_size))
     result.extend(_u32(len(pages)))
@@ -117,15 +97,7 @@ def _normalize_elements(
         if raw_name in seen:
             raise ValueError(f"duplicate element name: {raw_name}")
         seen.add(raw_name)
-
         element_type = ElementType(raw_type)
-        if element_type not in {
-            ElementType.INT,
-            ElementType.STRING,
-            ElementType.FLOAT,
-            ElementType.LONGLONG,
-        }:
-            raise NotImplementedError(f"unsupported @UTF element type: {element_type.name}")
         normalized.append((raw_name, element_type, constant_value))
     return normalized
 
@@ -148,21 +120,31 @@ def _pack_value(
     strings: "_StringTable",
     bytes_data: bytearray,
 ) -> None:
-    if element_type is ElementType.INT:
+    if element_type is ElementType.I32:
         target.extend(struct.pack(">i", int(value)))
-    elif element_type is ElementType.LONGLONG:
+    elif element_type is ElementType.U32:
+        target.extend(struct.pack(">I", int(value)))
+    elif element_type is ElementType.I64:
         target.extend(struct.pack(">q", int(value)))
-    elif element_type is ElementType.FLOAT:
-        target.extend(struct.pack(">f", float(value)))
+    elif element_type is ElementType.U64:
+        target.extend(struct.pack(">Q", int(value)))
+    elif element_type is ElementType.F32:
+        target.extend(struct.pack("<f", float(value)))
     elif element_type is ElementType.STRING:
         target.extend(_u32(strings.add("" if value is None else str(value))))
+    elif element_type is ElementType.I16:
+        target.extend(struct.pack(">h", int(value)))
+    elif element_type is ElementType.U16:
+        target.extend(struct.pack(">H", int(value)))
+    elif element_type is ElementType.I8:
+        target.extend(struct.pack(">b", int(value)))
+    elif element_type is ElementType.U8:
+        target.extend(struct.pack(">B", int(value)))
     else:
         raise NotImplementedError(f"unsupported @UTF element type: {element_type.name}")
 
 
 class _StringTable:
-    """Deduplicated, null-terminated Shift-JIS string table."""
-
     def __init__(self) -> None:
         self.data = bytearray()
         self._offsets: dict[str, int] = {}
